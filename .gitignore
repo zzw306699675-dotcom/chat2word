@@ -1,0 +1,35 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Environment
+.env
+.env.*
+venv/
+.venv/
+
+# macOS
+.DS_Store
+
+# Config (contains API keys)
+# Uncomment if you want to ignore local config
+# ~/.config/qwen_asr/
+
+# py2app
+*.app/

@@ -158,3 +158,98 @@ def test_start_stop_idempotent() -> None:
     controller.stop_session()  # should be no-op
 
     assert controller.state == SessionState.IDLE
+
+
+def test_cancel_session_cleans_up_from_recording() -> None:
+    recorder = FakeRecorder()
+    recognizer = FakeRecognizer()
+    paste = FakePasteService(success=True)
+    errors: list[tuple[str, str]] = []
+
+    controller = SessionController(
+        recorder=recorder,
+        recognizer=recognizer,
+        paste_service=paste,
+        on_error=lambda c, m: errors.append((c, m)),
+    )
+
+    controller.start_session()
+    assert controller.state == SessionState.RECORDING
+
+    controller.cancel_session("test cancel")
+
+    assert controller.state == SessionState.IDLE
+    assert recorder.stopped is True
+    assert recognizer.stopped is True
+    assert len(errors) == 1
+    assert errors[0][1] == "test cancel"
+
+
+def test_cancel_session_from_idle_is_noop() -> None:
+    recorder = FakeRecorder()
+    recognizer = FakeRecognizer()
+    paste = FakePasteService(success=True)
+
+    controller = SessionController(
+        recorder=recorder,
+        recognizer=recognizer,
+        paste_service=paste,
+    )
+
+    controller.cancel_session("noop")  # should not raise
+    assert controller.state == SessionState.IDLE
+
+
+def test_partial_callback_is_invoked() -> None:
+    recorder = FakeRecorder()
+    recognizer = FakeRecognizer()
+    paste = FakePasteService(success=True)
+    partials: list[str] = []
+
+    controller = SessionController(
+        recorder=recorder,
+        recognizer=recognizer,
+        paste_service=paste,
+        finalize_timeout_s=1.0,
+        on_partial=lambda t: partials.append(t),
+    )
+
+    controller.start_session()
+    recognizer.emit(RecognitionEvent(kind=RecognitionKind.PARTIAL.value, text="hello"))
+    recognizer.emit(RecognitionEvent(kind=RecognitionKind.PARTIAL.value, text="hello world"))
+
+    assert partials == ["hello", "hello world"]
+
+    # Clean up: emit final so stop doesn't timeout
+    def emit_final() -> None:
+        time.sleep(0.05)
+        recognizer.emit(RecognitionEvent(kind=RecognitionKind.FINAL.value, text="hello world"))
+
+    threading.Thread(target=emit_final, daemon=True).start()
+    controller.stop_session()
+    assert controller.state == SessionState.IDLE
+
+
+def test_empty_final_result_skips_paste() -> None:
+    recorder = FakeRecorder()
+    recognizer = FakeRecognizer()
+    paste = FakePasteService(success=True)
+
+    controller = SessionController(
+        recorder=recorder,
+        recognizer=recognizer,
+        paste_service=paste,
+        finalize_timeout_s=1.0,
+    )
+
+    controller.start_session()
+
+    def emit_empty_final() -> None:
+        time.sleep(0.05)
+        recognizer.emit(RecognitionEvent(kind=RecognitionKind.FINAL.value, text="   "))
+
+    threading.Thread(target=emit_empty_final, daemon=True).start()
+    controller.stop_session()
+
+    assert controller.state == SessionState.IDLE
+    assert paste.calls == []  # paste was never called

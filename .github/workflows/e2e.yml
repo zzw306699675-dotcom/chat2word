@@ -1,7 +1,10 @@
-name: E2E (Manual)
+name: E2E (Manual + Scheduled)
 
 on:
   workflow_dispatch:
+  schedule:
+    # 21:00 Asia/Shanghai = 13:00 UTC
+    - cron: "0 13 * * *"
 
 jobs:
   e2e:

@@ -100,6 +100,13 @@ class SessionController:
             self._safe_stop_recognizer()
             self._transition(SessionState.IDLE)
 
+    def replace_recognizer(self, recognizer: RecognizerAdapter) -> None:
+        with self._lock:
+            if self._state != SessionState.IDLE:
+                raise RuntimeError("cannot replace recognizer while session is active")
+            self._safe_stop_recognizer()
+            self._recognizer = recognizer
+
     def _run_paste(self, text: str) -> PasteResult:
         try:
             return self._paste_service.paste_text(text)
