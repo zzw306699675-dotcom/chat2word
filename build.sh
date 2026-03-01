@@ -1,0 +1,1 @@
+source .venv/bin/activate && python setup.py py2app && cp -R "dist/ASR Assistant.app" /Applications/

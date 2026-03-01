@@ -2,225 +2,244 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from queue import Queue
-from unittest.mock import MagicMock, patch
+import types
 
-import pytest
-
+import recognizer as rec_mod
 from models import AudioFrame, RecognitionEvent, RecognitionKind
-from recognizer import DashscopeRecognizerAdapter, _pcm_to_wav_base64
+from recognizer import DashscopeRecognizerAdapter, _ASRCallback
 
 
-# ---------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------
-
-def _make_frame(n_samples: int = 1600) -> AudioFrame:
-    """Generate a silent AudioFrame (all zeros)."""
-    return AudioFrame(
-        pcm16_bytes=b"\x00\x00" * n_samples,
-        sample_rate=16000,
-        channels=1,
-        timestamp_ms=0,
-    )
+class _FakeRecognitionResult:
+    @staticmethod
+    def is_sentence_end(sentence: dict) -> bool:
+        return bool(sentence.get("sentence_end"))
 
 
-def _wait_for_events(events: list, *, timeout: float = 3.0) -> None:
+class _FakeResult:
+    def __init__(self, text: str, sentence_end: bool) -> None:
+        self._sentence = {"text": text, "sentence_end": sentence_end}
+
+    def get_sentence(self) -> dict:
+        return self._sentence
+
+
+class _FakeRecognition:
+    def __init__(self, **kwargs) -> None:  # noqa: ANN003
+        self._callback = kwargs["callback"]
+
+    def start(self) -> None:
+        self._callback.on_open()
+
+    def send_audio_frame(self, _data: bytes) -> None:
+        self._callback.on_event(_FakeResult("partial", sentence_end=False))
+
+    def stop(self) -> None:
+        self._callback.on_event(_FakeResult("final", sentence_end=True))
+        self._callback.on_complete()
+        self._callback.on_close()
+
+
+def _make_frame() -> AudioFrame:
+    return AudioFrame(pcm16_bytes=b"\x00\x00" * 1600, sample_rate=16000, channels=1, timestamp_ms=0)
+
+
+def _wait_for_terminal(events: list[RecognitionEvent], timeout: float = 2.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if any(e.kind == RecognitionKind.FINAL.value or e.kind == RecognitionKind.ERROR.value for e in events):
+        if any(e.kind in (RecognitionKind.FINAL.value, RecognitionKind.ERROR.value) for e in events):
             return
-        time.sleep(0.05)
+        time.sleep(0.02)
 
 
-# ---------------------------------------------------------------
-# _pcm_to_wav_base64
-# ---------------------------------------------------------------
-
-def test_pcm_to_wav_base64_produces_valid_base64() -> None:
-    pcm = b"\x00\x00" * 1600  # 100ms of silence at 16kHz
-    result = _pcm_to_wav_base64(pcm, sample_rate=16000, channels=1)
-    assert isinstance(result, str)
-    assert len(result) > 0
-    # Decode should not raise
-    import base64
-    decoded = base64.b64decode(result)
-    # WAV header starts with RIFF
-    assert decoded[:4] == b"RIFF"
-
-
-# ---------------------------------------------------------------
-# Empty audio
-# ---------------------------------------------------------------
-
-def test_empty_audio_emits_final_with_empty_text() -> None:
-    adapter = DashscopeRecognizerAdapter(api_key="test-key")
+def test_asr_callback_emits_partial_and_final(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(rec_mod, "RecognitionResult", _FakeRecognitionResult)
     events: list[RecognitionEvent] = []
-    q: Queue[AudioFrame | None] = Queue()
-    q.put(None)  # immediate Sentinel
+    callback = _ASRCallback(events.append)
 
-    adapter.start(q, events.append)
-    _wait_for_events(events)
-    adapter.stop()
+    callback.on_event(_FakeResult("你好", sentence_end=False))
+    callback.on_event(_FakeResult("你好世界", sentence_end=True))
 
-    assert len(events) == 1
-    assert events[0].kind == RecognitionKind.FINAL.value
-    assert events[0].text == ""
+    assert [e.kind for e in events] == [RecognitionKind.PARTIAL.value, RecognitionKind.FINAL.value]
+    assert events[-1].text == "你好世界"
 
 
-# ---------------------------------------------------------------
-# Missing API key
-# ---------------------------------------------------------------
-
-@patch("recognizer.dashscope", MagicMock())
-@patch.dict("os.environ", {"DASHSCOPE_API_KEY": ""}, clear=False)
-def test_missing_api_key_emits_error() -> None:
-    adapter = DashscopeRecognizerAdapter(api_key="")
+def test_asr_callback_on_complete_emits_final_when_missing_sentence_end(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(rec_mod, "RecognitionResult", _FakeRecognitionResult)
     events: list[RecognitionEvent] = []
-    q: Queue[AudioFrame | None] = Queue()
-    q.put(_make_frame())
-    q.put(None)
+    callback = _ASRCallback(events.append)
 
-    adapter.start(q, events.append)
-    _wait_for_events(events)
-    adapter.stop()
+    callback.on_event(_FakeResult("半句结果", sentence_end=False))
+    callback.on_complete()
 
-    assert any(e.kind == RecognitionKind.ERROR.value for e in events)
-    error = next(e for e in events if e.kind == RecognitionKind.ERROR.value)
-    assert error.code == "AUTH_FAILED"
-
-
-# ---------------------------------------------------------------
-# Mock dashscope streaming response
-# ---------------------------------------------------------------
-
-def _fake_streaming_response():
-    """Simulate dashscope streaming chunks."""
-    yield {"output": {"choices": [{"message": {"content": [{"text": "你"}]}}]}}
-    yield {"output": {"choices": [{"message": {"content": [{"text": "你好"}]}}]}}
-    yield {"output": {"choices": [{"message": {"content": [{"text": "你好世界"}]}}]}}
-
-
-@patch("recognizer.dashscope")
-def test_successful_streaming_emits_partials_and_final(mock_ds: MagicMock) -> None:
-    mock_ds.MultiModalConversation.call.return_value = _fake_streaming_response()
-
-    adapter = DashscopeRecognizerAdapter(api_key="test-key")
-    events: list[RecognitionEvent] = []
-    q: Queue[AudioFrame | None] = Queue()
-    q.put(_make_frame())
-    q.put(None)
-
-    adapter.start(q, events.append)
-    _wait_for_events(events)
-    adapter.stop()
-
-    partials = [e for e in events if e.kind == RecognitionKind.PARTIAL.value]
     finals = [e for e in events if e.kind == RecognitionKind.FINAL.value]
-
-    assert len(partials) == 3
-    assert partials[0].text == "你"
-    assert partials[1].text == "你好"
-    assert partials[2].text == "你好世界"
     assert len(finals) == 1
-    assert finals[0].text == "你好世界"
+    assert finals[0].text == "半句结果"
 
 
-# ---------------------------------------------------------------
-# Network error mapping
-# ---------------------------------------------------------------
+def test_asr_callback_ignores_no_valid_audio_error(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(rec_mod, "RecognitionResult", _FakeRecognitionResult)
+    events: list[RecognitionEvent] = []
+    callback = _ASRCallback(events.append)
 
-@patch("recognizer.dashscope")
-def test_network_error_maps_correctly(mock_ds: MagicMock) -> None:
-    mock_ds.MultiModalConversation.call.side_effect = ConnectionError("network timeout")
+    callback.on_error(types.SimpleNamespace(message="NO_VALID_AUDIO_ERROR"))
+
+    assert events == []
+
+
+def test_start_with_fake_recognition_emits_partial_and_final(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(rec_mod, "_HAS_DASHSCOPE", True)
+    monkeypatch.setattr(rec_mod, "RecognitionResult", _FakeRecognitionResult)
+    monkeypatch.setattr(rec_mod, "Recognition", _FakeRecognition)
 
     adapter = DashscopeRecognizerAdapter(api_key="test-key")
-    events: list[RecognitionEvent] = []
     q: Queue[AudioFrame | None] = Queue()
     q.put(_make_frame())
     q.put(None)
+    events: list[RecognitionEvent] = []
 
     adapter.start(q, events.append)
-    _wait_for_events(events)
+    _wait_for_terminal(events)
     adapter.stop()
 
-    errors = [e for e in events if e.kind == RecognitionKind.ERROR.value]
-    assert len(errors) == 1
-    assert errors[0].code == "NETWORK_ERROR"
-    assert errors[0].retryable is True
+    assert any(e.kind == RecognitionKind.PARTIAL.value for e in events)
+    finals = [e for e in events if e.kind == RecognitionKind.FINAL.value]
+    assert len(finals) == 1
+    assert finals[0].text == "final"
 
 
-# ---------------------------------------------------------------
-# Auth error mapping
-# ---------------------------------------------------------------
+def test_missing_api_key_emits_auth_error(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(rec_mod, "_HAS_DASHSCOPE", True)
+    monkeypatch.setattr(rec_mod, "Recognition", _FakeRecognition)
+    monkeypatch.setattr(rec_mod, "RecognitionResult", _FakeRecognitionResult)
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
 
-@patch("recognizer.dashscope")
-def test_auth_error_maps_correctly(mock_ds: MagicMock) -> None:
-    mock_ds.MultiModalConversation.call.side_effect = Exception("401 Unauthorized: invalid api key")
-
-    adapter = DashscopeRecognizerAdapter(api_key="bad-key")
-    events: list[RecognitionEvent] = []
+    adapter = DashscopeRecognizerAdapter(api_key="")
     q: Queue[AudioFrame | None] = Queue()
     q.put(_make_frame())
     q.put(None)
+    events: list[RecognitionEvent] = []
 
     adapter.start(q, events.append)
-    _wait_for_events(events)
+    _wait_for_terminal(events)
     adapter.stop()
 
     errors = [e for e in events if e.kind == RecognitionKind.ERROR.value]
     assert len(errors) == 1
     assert errors[0].code == "AUTH_FAILED"
-    assert errors[0].retryable is False
 
 
-# ---------------------------------------------------------------
-# dashscope not installed
-# ---------------------------------------------------------------
+def test_dashscope_missing_emits_protocol_error(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(rec_mod, "_HAS_DASHSCOPE", False)
 
-@patch("recognizer.dashscope", None)
-def test_dashscope_not_installed_emits_error() -> None:
     adapter = DashscopeRecognizerAdapter(api_key="test-key")
-    events: list[RecognitionEvent] = []
     q: Queue[AudioFrame | None] = Queue()
     q.put(_make_frame())
     q.put(None)
+    events: list[RecognitionEvent] = []
 
     adapter.start(q, events.append)
-    _wait_for_events(events)
+    _wait_for_terminal(events)
     adapter.stop()
 
     errors = [e for e in events if e.kind == RecognitionKind.ERROR.value]
     assert len(errors) == 1
-    assert "not installed" in errors[0].message
+    assert errors[0].code == "ASR_PROTOCOL_ERROR"
 
 
-# ---------------------------------------------------------------
-# Stop event during recognition
-# ---------------------------------------------------------------
+def test_start_error_maps_network_error(monkeypatch) -> None:  # noqa: ANN001
+    class _StartErrorRecognition(_FakeRecognition):
+        def start(self) -> None:
+            raise ConnectionError("network timeout")
 
-@patch("recognizer.dashscope")
-def test_stop_during_streaming_cancels_gracefully(mock_ds: MagicMock) -> None:
-    def slow_response():
-        yield {"output": {"choices": [{"message": {"content": [{"text": "hello"}]}}]}}
-        time.sleep(5)  # hang to simulate slow stream
-        yield {"output": {"choices": [{"message": {"content": [{"text": "world"}]}}]}}
-
-    mock_ds.MultiModalConversation.call.return_value = slow_response()
+    monkeypatch.setattr(rec_mod, "_HAS_DASHSCOPE", True)
+    monkeypatch.setattr(rec_mod, "Recognition", _StartErrorRecognition)
+    monkeypatch.setattr(rec_mod, "RecognitionResult", _FakeRecognitionResult)
 
     adapter = DashscopeRecognizerAdapter(api_key="test-key")
-    events: list[RecognitionEvent] = []
     q: Queue[AudioFrame | None] = Queue()
     q.put(_make_frame())
     q.put(None)
+    events: list[RecognitionEvent] = []
 
     adapter.start(q, events.append)
-    time.sleep(0.3)  # let worker pick up and start streaming
+    _wait_for_terminal(events)
     adapter.stop()
-    time.sleep(0.2)
 
-    # Should NOT have final event since we stopped mid-stream
-    finals = [e for e in events if e.kind == RecognitionKind.FINAL.value]
-    assert len(finals) == 0
+    errors = [e for e in events if e.kind == RecognitionKind.ERROR.value]
+    assert len(errors) == 1
+    assert errors[0].code == "NETWORK_ERROR"
+
+
+def test_start_error_maps_auth_failed(monkeypatch) -> None:  # noqa: ANN001
+    class _StartErrorRecognition(_FakeRecognition):
+        def start(self) -> None:
+            raise RuntimeError("401 unauthorized api key")
+
+    monkeypatch.setattr(rec_mod, "_HAS_DASHSCOPE", True)
+    monkeypatch.setattr(rec_mod, "Recognition", _StartErrorRecognition)
+    monkeypatch.setattr(rec_mod, "RecognitionResult", _FakeRecognitionResult)
+
+    adapter = DashscopeRecognizerAdapter(api_key="bad")
+    q: Queue[AudioFrame | None] = Queue()
+    q.put(_make_frame())
+    q.put(None)
+    events: list[RecognitionEvent] = []
+
+    adapter.start(q, events.append)
+    _wait_for_terminal(events)
+    adapter.stop()
+
+    errors = [e for e in events if e.kind == RecognitionKind.ERROR.value]
+    assert len(errors) == 1
+    assert errors[0].code == "AUTH_FAILED"
+
+
+def test_health_snapshot_updates_after_streaming(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(rec_mod, "_HAS_DASHSCOPE", True)
+    monkeypatch.setattr(rec_mod, "RecognitionResult", _FakeRecognitionResult)
+    monkeypatch.setattr(rec_mod, "Recognition", _FakeRecognition)
+
+    adapter = DashscopeRecognizerAdapter(api_key="test-key")
+    q: Queue[AudioFrame | None] = Queue()
+    q.put(_make_frame())
+    q.put(None)
+    events: list[RecognitionEvent] = []
+
+    before = adapter.get_health_snapshot()
+    assert before["thread_alive"] is False
+    assert before["last_event_at_ms"] == 0
+    assert before["final_emitted"] is False
+    assert before["connection_active"] is False
+    assert before["queue_backlog"] == 0
+    assert before["exception_count"] == 0
+
+    adapter.start(q, events.append)
+    _wait_for_terminal(events)
+    adapter.stop()
+
+    after = adapter.get_health_snapshot()
+    assert after["thread_alive"] is False
+    assert after["last_event_at_ms"] > 0
+    assert after["final_emitted"] is True
+    assert after["connection_active"] is False
+    assert after["queue_backlog"] == 0
+    assert after["exception_count"] == 0
+
+
+def test_health_snapshot_counts_exceptions(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(rec_mod, "_HAS_DASHSCOPE", False)
+
+    adapter = DashscopeRecognizerAdapter(api_key="test-key")
+    q: Queue[AudioFrame | None] = Queue()
+    q.put(_make_frame())
+    q.put(None)
+    events: list[RecognitionEvent] = []
+
+    adapter.start(q, events.append)
+    _wait_for_terminal(events)
+    adapter.stop()
+
+    snapshot = adapter.get_health_snapshot()
+    assert snapshot["exception_count"] == 1

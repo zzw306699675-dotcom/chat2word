@@ -35,6 +35,7 @@ class SoundDeviceRecorder:
         self._lock = threading.Lock()
         self.dropped_chunks = 0
         self._audio_queue: Queue[AudioFrame | None] | None = None
+        self._sentinel_emitted = False
 
     def start(self, audio_queue: Queue[AudioFrame | None]) -> None:
         with self._lock:
@@ -43,6 +44,7 @@ class SoundDeviceRecorder:
             if sd is None:
                 raise RuntimeError("sounddevice is not installed")
             self._audio_queue = audio_queue
+            self._sentinel_emitted = False
             blocksize = int(self.sample_rate * (self.chunk_ms / 1000.0))
             self._stream = sd.InputStream(
                 samplerate=self.sample_rate,
@@ -84,9 +86,13 @@ class SoundDeviceRecorder:
             self.dropped_chunks += 1
 
     def _emit_sentinel_if_needed(self) -> None:
-        if self._audio_queue is None:
+        if self._audio_queue is None or self._sentinel_emitted:
             return
-        try:
-            self._audio_queue.put_nowait(None)
-        except Full:
-            pass
+        # Queue may be briefly full when stop is called; retry with short waits.
+        for _ in range(3):
+            try:
+                self._audio_queue.put(None, timeout=0.05)
+                self._sentinel_emitted = True
+                return
+            except Full:
+                continue

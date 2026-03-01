@@ -5,7 +5,9 @@ from __future__ import annotations
 from queue import Queue
 from typing import Callable, Protocol
 
-from models import AudioFrame, PasteResult, RecognitionEvent
+from datetime import datetime
+
+from models import AudioFrame, PasteResult, RecognitionEvent, SessionMode
 
 
 class Recorder(Protocol):
@@ -25,7 +27,24 @@ class RecognizerAdapter(Protocol):
 
 
 class PasteService(Protocol):
-    def paste_text(self, text: str) -> PasteResult: ...
+    def paste_text(self, text: str, target_app: object = None) -> PasteResult: ...
+
+
+class LLMAdapter(Protocol):
+    def polish_text(self, text: str) -> str: ...
+
+
+class HistoryLogger(Protocol):
+    def append_record(
+        self,
+        *,
+        mode: SessionMode,
+        raw_text: str,
+        polished_text: str | None,
+        llm_error: str | None,
+        paste_result: PasteResult,
+        event_time: datetime | None = None,
+    ) -> None: ...
 
 
 class ConfigStore(Protocol):
@@ -36,3 +55,7 @@ class ConfigStore(Protocol):
     def get_hotkey(self) -> str: ...
 
     def set_hotkey(self, hotkey: str) -> None: ...
+
+    def get_secondary_hotkey(self) -> str: ...
+
+    def set_secondary_hotkey(self, hotkey: str) -> None: ...

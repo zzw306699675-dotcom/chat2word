@@ -1,27 +1,86 @@
 # chat2word
 
-这是一个正在建设中的 macOS 平台实时语音转文字辅助工具。它能够常驻于系统托盘，监听全局快捷键进行录音，并将语音实时通过阿里云千问 API 转换为文本，最终自动粘贴至用户光标所在输入框。
+chat2word 是一款 macOS 平台下的实时语音转文字辅助工具。它常驻系统托盘，监听全局快捷键进行录音，并将语音实时通过阿里云大模型接口转换为文本，最终自动粘贴至用户光标所在的任何输入框中。
 
-## 核心特性设计
-- 🎧 全局快捷键录音控制 (如 `Option` 键组合长按)
-- ☁️ 基于阿里云 DashScope `qwen3-asr-flash` 实现流式、高精度、低延迟中文识别
-- 🪄 悬浮半透明 UI 实时展示短句中间识别态
-- 📋 增强型剪贴板管理：自动完成上屏而不丢失用户的旧剪贴板内容
+## ✨ 核心特性
 
-## 项目进度 (MVP 化阶段)
-当前项目正处于基础设施建设前期的架构设计规划完成节点，以下文档沉淀了本次实施的路线与策略：
-- [`技术路线.md`](./技术路线.md): 规划了采用 Python + PySide6 的全局技术体系、线程模型及 MVP V2 演进决策。
-- [`功能详细设计.md`](./功能详细设计.md): 从 SessionController、HotkeyAdapter 到 PasteService 等 7 大模块的 I/O、失败恢复、超时设计。
-- [`测试方案.md`](./测试方案.md): 分为 Unit / Integration / E2E / Manual 的多维测试防护网与 Github CI 接入规范。
+- **🎧 全局快捷键录音**：按住快捷键说话，松开即刻上屏，无需等待。
+- **🚀 流式实时识别**：基于阿里云 `fun-asr-realtime` 实时识别服务，边说边转文字，并配有悬浮窗实时展示中间结果。
+- **🪄 LLM 智能润色**：特有“润色模式”（默认右 Option 键 / `Option_R`），识别完成后自动调用大模型（千问）整理逻辑、优化排版（支持自动 1、2、3 编号），让口语变书面语。
+- **📋 无痕内容粘贴**：自动完成上屏，绝不覆盖或丢失您原有的系统剪贴板内容。
+- **📝 Markdown 历史日志**：每一次识别与润色都会自动按天记录到本地的 Markdown 文件中，方便随时找回历史输入。
+- **🩺 诊断快照导出**：托盘菜单支持一键导出诊断 JSON（健康状态 + 最近健康事件 + 指标摘要），用于快速排障。
 
-## 快速浏览核心架构 (Draft)
-```mermaid
-graph TD
-    A[Hotkey: press] -->|start_session| B(SessionController)
-    B -->|start_recording| C(Recorder)
-    C -->|AudioFrames| D(RecognizerAdapter)
-    D -->|RecognitionEvent: partial/final| B
-    B -->|update_text| E(OverlayView/Tray)
-    D -->|RecognitionEvent: final| F(PasteService)
-    F -->|Command_V| G(Active Win Input)
+## 📥 安装指南
+
+### 方式一：下载构建好的应用包（推荐）
+如果您已经拥有了打包好的 `ASR Assistant.app`，直接将其拖入 macOS 的 `应用程序 (Applications)` 文件夹中双击运行即可。
+*(如果遇到权限提示，请前往“系统设置 -> 隐私与安全性”中放行对应的权限。)*
+
+### 方式二：源码运行与构建
+1. **环境准备**：
+   确保您的 macOS 环境中已安装 Python 3.10 及以上版本。
+   ```bash
+   git clone <您的仓库地址>
+   cd chat2word
+   pip install -r requirements.txt
+   ```
+2. **直接运行**：
+   ```bash
+   python main.py
+   ```
+3. **打包为 macOS 应用 (.app)**：
+   运行项目根目录提供的一键打包脚本：
+   ```bash
+   ./build.sh
+   ```
+   打包完成后，应用将生成在 `dist/ASR Assistant.app`。您可以将其移动到 `Applications` 文件夹以便日常使用。
+
+## ⚙️ 配置与使用操作说明
+
+### 1. 准备 API Key
+本项目依赖阿里云的大模型服务，您需要前往 [阿里云百炼控制台](https://bailian.console.aliyun.com/) 获取开启了对应模型调用权限的 API Key。
+支持两种填入方式：
+- **设置界面（推荐）**：启动应用后，点击系统菜单栏托盘的图标，选择“设置”，在其中填入 API Key 并保存。
+- **环境变量**：在项目根目录创建 `.env` 文件，写入：`DASHSCOPE_API_KEY=sk-xxxxxx`。
+
+### 2. 功能操作演示
+程序启动后会在系统托盘显示一个圆形状态指示图标。
+
+- **基础语音输入 (默认左 `Option` 键)**：
+  - **按住** 左 `Option` 键开始说话。
+  - 说话过程中，屏幕顶部会出现悬浮窗显示您的实时语音内容。
+  - **松开** 键位，识别结果会自动原样粘贴到您当前光标所在的输入框中。
+
+- **LLM 智能润色输入 (默认右 `Option` 键)**：
+  - **按住** 右 `Option` 键开始说话。
+  - **松开** 键位后，悬浮窗将提示“✨ 润色中...”。
+  - 稍等片刻，经过大模型结构化梳理和语言润色的最终文本会自动粘贴输出。
+
+- **查找历史记录日志**：
+  - 打开 macOS 的 Finder 窗口，按下 `Cmd + Shift + G`，输入 `~/Library/Application Support/ASR-Assistant/history/` 即可看到按天记录的文件。
+  - 日志中详细记录了每次输入发生的时间、模式、您的原始语音文本以及 LLM 润色后的结构化文本，以防文字丢失。
+- **导出诊断快照**：
+  - 点击托盘图标菜单中的 `Export Diagnostics`。
+  - 导出的 JSON 文件路径：`~/Library/Application Support/ASR-Assistant/diagnostics/`。
+  - 文件包含当前会话健康快照、最近 HEALTH 事件和汇总指标（成功率、恢复率等）。
+
+## ⚠️ 常见反馈与注意事项
+- **辅助功能权限**：软件必须要开启 macOS 的**辅助功能 (Accessibility)**权限才能实现全局监听按键以及触发模拟键盘 `Cmd + V` 粘贴。如果您发现按快捷键没反应、或者没有自动粘贴，请前往 `系统设置 -> 隐私与安全性 -> 辅助功能` 勾选该应用。
+- **麦克风权限**：需要允许麦克风访问权限以录音。
+- **网络条件**：本语音及大模型模块皆依赖阿里云在线服务，使用时请保持网络畅通。
+
+### 健康日志汇总脚本
+可使用脚本快速统计健康日志中的关键指标（成功率、恢复率、错误码分布）：
+```bash
+python scripts/health_summary.py
 ```
+输出 JSON：
+```bash
+python scripts/health_summary.py --json
+```
+
+## 🛠 技术栈与架构参考
+- 语言及 UI：Python 3 + PySide6
+- 原生模块介入：PyObjC (macOS 原生 NSEvent 监听与焦点调度控制)
+- 语音与模型服务：阿里云 DashScope API (`fun-asr-realtime`, `qwen3.5-plus`) 

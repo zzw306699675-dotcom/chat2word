@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from queue import Queue
 from unittest.mock import MagicMock, patch
@@ -101,10 +102,10 @@ def test_stop_is_idempotent(mock_sd: MagicMock) -> None:
     recorder.stop()
     recorder.stop()  # second stop: should not raise
 
-    # First stop emits sentinel, second stop also tries but we accept that
+    # Sentinel is emitted once per session.
     sentinel_1 = q.get_nowait()
     assert sentinel_1 is None
-    # The implementation emits sentinel on each stop() call which is acceptable
+    assert q.empty()
 
 
 # ---------------------------------------------------------------
@@ -175,6 +176,39 @@ def test_stop_emits_sentinel(mock_sd: MagicMock) -> None:
 
     sentinel = q.get_nowait()
     assert sentinel is None
+
+
+@patch("recorder.sd")
+def test_stop_emits_single_sentinel_per_session(mock_sd: MagicMock) -> None:
+    mock_sd.InputStream.return_value = MagicMock()
+
+    recorder = SoundDeviceRecorder()
+    q: Queue[AudioFrame | None] = Queue()
+    recorder.start(q)
+    recorder.stop()
+    recorder.stop()
+
+    assert q.get_nowait() is None
+    assert q.empty()
+
+
+@patch("recorder.sd")
+def test_sentinel_retry_when_queue_is_full(mock_sd: MagicMock) -> None:
+    mock_sd.InputStream.return_value = MagicMock()
+
+    recorder = SoundDeviceRecorder()
+    q: Queue[AudioFrame | None] = Queue(maxsize=1)
+    recorder.start(q)
+    q.put_nowait(_make_fake_audio_data(1600))
+
+    def _drain_one_frame() -> None:
+        time.sleep(0.03)
+        q.get_nowait()
+
+    threading.Thread(target=_drain_one_frame, daemon=True).start()
+    recorder.stop()
+
+    assert q.get(timeout=0.3) is None
 
 
 # ---------------------------------------------------------------

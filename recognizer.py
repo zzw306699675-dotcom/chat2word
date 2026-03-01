@@ -1,62 +1,51 @@
-"""ASR recognizer adapter using DashScope qwen3-asr-flash.
+"""ASR recognizer adapter using DashScope fun-asr-realtime (WebSocket streaming).
 
-The qwen3-asr-flash model accepts complete audio (file path, URL, or base64)
-and streams back recognition results via ``stream=True``.  We collect PCM
-frames from the audio queue, convert to a temporary WAV file, and feed
-it to the model.  Partial results flow through ``on_event`` in real time.
+Uses dashscope.audio.asr.Recognition for real-time speech recognition via
+WebSocket.  Audio frames are forwarded to the service in real-time using
+send_audio_frame(), and results are received asynchronously via callbacks.
 """
 
 from __future__ import annotations
 
-import base64
-import io
+import logging
 import os
-import struct
 import threading
-import wave
+import time
 from queue import Empty, Queue
 from typing import Callable, Optional
 
 from errors import ASR_PROTOCOL_ERROR, AUTH_FAILED, NETWORK_ERROR
 from models import AudioFrame, RecognitionEvent, RecognitionKind
 
+log = logging.getLogger(__name__)
+
 try:
     import dashscope
+    from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
+    _HAS_DASHSCOPE = True
 except Exception:  # pragma: no cover
-    dashscope = None  # type: ignore
-
-
-def _pcm_to_wav_base64(
-    pcm: bytes,
-    sample_rate: int = 16000,
-    channels: int = 1,
-    sample_width: int = 2,
-) -> str:
-    """Convert raw PCM bytes to a base64-encoded WAV string."""
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(sample_width)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm)
-    wav_bytes = buf.getvalue()
-    return base64.b64encode(wav_bytes).decode("ascii")
+    _HAS_DASHSCOPE = False
 
 
 class DashscopeRecognizerAdapter:
     def __init__(
         self,
         api_key: str,
-        model: str = "qwen3-asr-flash",
-        request_timeout_s: float = 10.0,
+        model: str = "fun-asr-realtime",
+        sample_rate: int = 16000,
     ) -> None:
         self._api_key = api_key
         self._model = model
-        self._request_timeout_s = request_timeout_s
+        self._sample_rate = sample_rate
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._audio_queue: Optional[Queue[AudioFrame | None]] = None
         self._on_event: Optional[Callable[[RecognitionEvent], None]] = None
+        self._recognition: Optional[object] = None
+        self._last_event_at_ms = 0
+        self._last_partial_text = ""
+        self._final_emitted = False
+        self._exception_count = 0
 
     def start(
         self,
@@ -67,6 +56,10 @@ class DashscopeRecognizerAdapter:
             return
         self._audio_queue = audio_queue
         self._on_event = on_event
+        self._last_event_at_ms = 0
+        self._last_partial_text = ""
+        self._final_emitted = False
+        self._exception_count = 0
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
@@ -74,121 +67,107 @@ class DashscopeRecognizerAdapter:
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=0.5)
+            self._thread.join(timeout=3.0)
+
+    def get_health_snapshot(self) -> dict[str, object]:
+        return {
+            "thread_alive": bool(self._thread and self._thread.is_alive()),
+            "stop_event_set": self._stop_event.is_set(),
+            "connection_active": self._recognition is not None,
+            "queue_backlog": self._audio_queue.qsize() if self._audio_queue else 0,
+            "last_event_at_ms": self._last_event_at_ms,
+            "final_emitted": self._final_emitted,
+            "last_partial_text": self._last_partial_text,
+            "exception_count": self._exception_count,
+        }
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
     def _worker(self) -> None:
-        """Consume audio frames until Sentinel, then recognise."""
+        """Start Recognition, feed audio frames, then stop."""
         if self._audio_queue is None or self._on_event is None:
             return
 
-        pcm = bytearray()
-        sample_rate = 16000
-        channels = 1
-
-        while not self._stop_event.is_set():
-            try:
-                frame = self._audio_queue.get(timeout=0.2)
-            except Empty:
-                continue
-            if frame is None:  # Sentinel
-                break
-            pcm.extend(frame.pcm16_bytes)
-            sample_rate = frame.sample_rate
-            channels = frame.channels
-
-        if self._stop_event.is_set():
-            return
-
-        if not pcm:
-            self._on_event(RecognitionEvent(kind=RecognitionKind.FINAL.value, text=""))
-            return
-
-        # Convert collected PCM to base64-encoded WAV for dashscope
-        wav_b64 = _pcm_to_wav_base64(bytes(pcm), sample_rate, channels)
-        self._recognize_stream(wav_b64)
-
-    def _recognize_stream(self, wav_base64: str) -> None:  # noqa: C901
-        """Send audio to dashscope and stream partial/final results."""
-        if self._on_event is None:
-            return
-        if dashscope is None:
-            self._on_event(
-                RecognitionEvent(
-                    kind=RecognitionKind.ERROR.value,
-                    code=ASR_PROTOCOL_ERROR,
-                    message="dashscope is not installed",
-                    retryable=False,
-                )
-            )
+        if not _HAS_DASHSCOPE:
+            self._on_callback_event(RecognitionEvent(
+                kind=RecognitionKind.ERROR.value,
+                code=ASR_PROTOCOL_ERROR,
+                message="dashscope is not installed",
+                retryable=False,
+            ))
             return
 
         api_key = self._api_key or os.getenv("DASHSCOPE_API_KEY", "")
         if not api_key:
-            self._on_event(
-                RecognitionEvent(
-                    kind=RecognitionKind.ERROR.value,
-                    code=AUTH_FAILED,
-                    message="No API key configured",
-                    retryable=False,
-                )
-            )
+            self._on_callback_event(RecognitionEvent(
+                kind=RecognitionKind.ERROR.value,
+                code=AUTH_FAILED,
+                message="No API key configured",
+                retryable=False,
+            ))
             return
 
+        # Configure dashscope
+        dashscope.api_key = api_key
+        dashscope.base_websocket_api_url = 'wss://dashscope.aliyuncs.com/api-ws/v1/inference'
+
+        # Build callback
+        callback = _ASRCallback(self._on_callback_event)
+
         try:
-            response = dashscope.MultiModalConversation.call(
-                api_key=api_key,
+            recognition = Recognition(
                 model=self._model,
-                messages=[
-                    {"role": "system", "content": [{"text": ""}]},
-                    {"role": "user", "content": [{"audio": wav_base64}]},
-                ],
-                result_format="message",
-                asr_options={"enable_itn": False},
-                stream=True,
-                timeout=self._request_timeout_s,
+                format='pcm',
+                sample_rate=self._sample_rate,
+                semantic_punctuation_enabled=False,
+                callback=callback,
             )
+            self._recognition = recognition
+            log.info("Starting Recognition (model=%s, rate=%d)", self._model, self._sample_rate)
+            recognition.start()
         except Exception as exc:
-            self._on_event(self._to_error_event(exc))
+            log.error("Recognition start failed: %s", exc, exc_info=True)
+            self._on_callback_event(self._to_error_event(exc))
             return
 
-        latest_text = ""
+        # Feed audio frames from the queue
         try:
-            for chunk in response:
-                if self._stop_event.is_set():
-                    return
-                text = self._extract_text(chunk)
-                if text:
-                    latest_text = text
-                    self._on_event(
-                        RecognitionEvent(kind=RecognitionKind.PARTIAL.value, text=text)
-                    )
+            while not self._stop_event.is_set():
+                try:
+                    frame = self._audio_queue.get(timeout=0.1)
+                except Empty:
+                    continue
+                if frame is None:  # Sentinel — recording stopped
+                    break
+                recognition.send_audio_frame(frame.pcm16_bytes)
         except Exception as exc:
-            self._on_event(self._to_error_event(exc))
+            log.error("Error sending audio: %s", exc, exc_info=True)
+            self._on_callback_event(self._to_error_event(exc))
             return
 
-        self._on_event(
-            RecognitionEvent(kind=RecognitionKind.FINAL.value, text=latest_text)
-        )
+        # Stop recognition (blocks until final result is received)
+        try:
+            log.info("Stopping Recognition (waiting for final result)...")
+            recognition.stop()
+            log.info("Recognition stopped")
+        except Exception as exc:
+            log.error("Recognition stop error: %s", exc, exc_info=True)
+            # Don't emit error here — the callback may have already emitted the final result
 
-    def _extract_text(self, chunk: object) -> str:
-        """Pull text from a dashscope streaming chunk dict."""
-        if isinstance(chunk, dict):
-            output = chunk.get("output", {})
-            choices = output.get("choices", [])
-            if not choices:
-                return ""
-            message = choices[0].get("message", {})
-            content = message.get("content", [])
-            if not content:
-                return ""
-            value = content[0]
-            if isinstance(value, dict):
-                return str(value.get("text", ""))
-        return ""
+        self._recognition = None
+
+    def _on_callback_event(self, event: RecognitionEvent) -> None:
+        self._last_event_at_ms = int(time.time() * 1000)
+        if event.kind == RecognitionKind.PARTIAL.value:
+            self._last_partial_text = event.text
+        elif event.kind == RecognitionKind.FINAL.value:
+            self._final_emitted = True
+        elif event.kind == RecognitionKind.ERROR.value:
+            self._exception_count += 1
+        if self._on_event:
+            self._on_event(event)
 
     def _to_error_event(self, exc: Exception) -> RecognitionEvent:
         """Map an SDK/network exception to a standard error event."""
@@ -209,3 +188,65 @@ class DashscopeRecognizerAdapter:
             message=message,
             retryable=retryable,
         )
+
+
+class _ASRCallback(RecognitionCallback):
+    """Bridge between dashscope RecognitionCallback and our RecognitionEvent system."""
+
+    def __init__(self, on_event: Callable[[RecognitionEvent], None]) -> None:
+        self._on_event = on_event
+        self._latest_text = ""
+        self._final_emitted = False
+
+    def on_open(self) -> None:
+        log.info("ASR WebSocket connected")
+
+    def on_close(self) -> None:
+        log.info("ASR WebSocket closed")
+
+    def on_event(self, result: RecognitionResult) -> None:
+        sentence = result.get_sentence()
+        if not sentence or 'text' not in sentence:
+            return
+        text = sentence['text']
+        self._latest_text = text
+
+        if RecognitionResult.is_sentence_end(sentence):
+            log.info("ASR sentence end: %s", text)
+            self._final_emitted = True
+            self._on_event(RecognitionEvent(
+                kind=RecognitionKind.FINAL.value,
+                text=text,
+            ))
+        else:
+            log.debug("ASR partial: %s", text)
+            self._on_event(RecognitionEvent(
+                kind=RecognitionKind.PARTIAL.value,
+                text=text,
+            ))
+
+    def on_complete(self) -> None:
+        log.info("ASR recognition completed")
+        # Some edge cases (e.g., long pauses/no valid sentence-end) may not
+        # emit a FINAL event. Emit one here to let the session finalize safely.
+        if not self._final_emitted:
+            self._final_emitted = True
+            self._on_event(RecognitionEvent(
+                kind=RecognitionKind.FINAL.value,
+                text=self._latest_text,
+            ))
+
+    def on_error(self, result: RecognitionResult) -> None:
+        msg = getattr(result, 'message', str(result))
+        # Long silence while holding the key can trigger NO_VALID_AUDIO_ERROR
+        # on some streams. Treat it as non-fatal so the session can continue.
+        if "NO_VALID_AUDIO_ERROR" in str(msg).upper():
+            log.warning("ASR no-valid-audio ignored: %s", msg)
+            return
+        log.error("ASR error: %s", msg)
+        self._on_event(RecognitionEvent(
+            kind=RecognitionKind.ERROR.value,
+            code=ASR_PROTOCOL_ERROR,
+            message=str(msg),
+            retryable=True,
+        ))

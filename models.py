@@ -9,9 +9,18 @@ from enum import Enum
 class SessionState(str, Enum):
     IDLE = "IDLE"
     RECORDING = "RECORDING"
+    FINALIZING_GRACE = "FINALIZING_GRACE"
+    RECOGNIZING_DRAIN = "RECOGNIZING_DRAIN"
     FINALIZING = "FINALIZING"
+    LLM_PROCESSING = "LLM_PROCESSING"
     PASTING = "PASTING"
+    RECOVERING = "RECOVERING"
     ERROR = "ERROR"
+
+
+class SessionMode(str, Enum):
+    RAW = "RAW"
+    POLISH = "POLISH"
 
 
 class RecognitionKind(str, Enum):
